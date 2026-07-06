@@ -153,6 +153,15 @@ class TransferEngineBase {
                     const std::vector<int64_t>& local_block_ids,
                     int parallelism = 1);
 
+  int64_t StartRead(const std::string& req_id, uint64_t uuid,
+                    const std::string& remote_endpoint,
+                    const std::vector<int64_t>& local_block_ids,
+                    const std::vector<int64_t>& layers,
+                    const std::vector<int64_t>& src_offsets,
+                    const std::vector<int64_t>& dst_offsets,
+                    const std::vector<int64_t>& sizes,
+                    int parallelism = 1);
+
   std::vector<int64_t> PollTransferOps();
 
   void WaitTransfer(int64_t op_id);
@@ -257,6 +266,7 @@ class TransferEngineBase {
   static constexpr uint32_t kResponseMagic = 0x44494152;
   static constexpr uint32_t kOpAck = 2;
   static constexpr uint32_t kOpPullStream = 3;
+  static constexpr uint32_t kOpSegmentPullStream = 5;
 
   std::string EndpointWithPort(const std::string& endpoint, int port) const;
   ControlResponseHeader ReadControlResponseHeader(int fd);
@@ -278,6 +288,7 @@ class TransferEngineBase {
   void ControlServerLoop();
   void HandleControlConnection(int fd);
   void ProcessPullStream(int fd, const ControlRequestHeader& req);
+  void ProcessSegmentPullStream(int fd, const ControlRequestHeader& req);
   void AckRemote(const std::string& remote_endpoint, uint64_t uuid);
   absl::Status WaitForStagingBlockRead(size_t layer_idx, size_t shard_idx,
                                        int block_id);
@@ -296,6 +307,7 @@ class TransferEngineBase {
   static kv_cache::KVCacheCopySpec ToKVCacheCopySpec(const CopySpec& spec);
 
   std::unique_ptr<kv_cache::KVCacheManagerBase> kv_transfer_;
+  std::shared_ptr<TransferFuture> last_segment_future_;
   int64_t tp_rank_ = 0;
   int local_control_port_ = 0;
   int local_data_port_ = 0;

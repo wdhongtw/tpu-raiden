@@ -160,8 +160,27 @@ absl::Status RaidenManagerBase::PullWeightsChunk(
                                    dst_shard_idx, dst_offset_bytes, size_bytes);
 }
 
+absl::Status RaidenManagerBase::PullSegments(
+    const std::string& peer,
+    const std::vector<int64_t>& layers,
+    const std::vector<int64_t>& src_offsets,
+    const std::vector<int64_t>& dst_offsets,
+    const std::vector<int64_t>& sizes,
+    const std::vector<uint8_t*>& explicit_dst_ptrs,
+    int parallelism) {
+  if (!server_) {
+    return absl::FailedPreconditionError("Transport server is not running");
+  }
+  return server_->PullSegments(peer, layers, src_offsets, dst_offsets, sizes,
+                               explicit_dst_ptrs, parallelism);
+}
+
 size_t RaidenManagerBase::bytes_per_block() const {
   return block_size_ * slice_byte_size_;
+}
+
+size_t RaidenManagerBase::bytes_per_block(size_t layer_idx) const {
+  return bytes_per_block();
 }
 
 xla::Future<> RaidenManagerBase::RemoteD2DBlockWrite(const BlockMetadata& src,

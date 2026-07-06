@@ -317,10 +317,11 @@ absl::Status BlockTransport::ProcessSingleRequest(int client_fd) {
         header.num_blocks, [&](size_t l, size_t sh, size_t k) -> absl::Status {
           ABSL_DCHECK_LT(k, allocated_ids.size());
           const int dst_id = allocated_ids[k];
+          size_t layer_bytes_per_block = delegate_->bytes_per_block(l);
           RETURN_IF_ERROR(ValidateBlockRange(
-              delegate_, l, sh, dst_id, /*num_blocks=*/1, bytes_per_block));
+              delegate_, l, sh, dst_id, /*num_blocks=*/1, layer_bytes_per_block));
           uint8_t* dest_ptr = delegate_->GetBlockHostPointer(l, sh, dst_id);
-          return ReadExact(client_fd, dest_ptr, bytes_per_block);
+          return ReadExact(client_fd, dest_ptr, layer_bytes_per_block);
         }));
 
     uint8_t ack = 1;
@@ -358,12 +359,13 @@ absl::Status BlockTransport::ProcessSingleRequest(int client_fd) {
         major_order, delegate_->num_layers(), delegate_->num_shards(),
         local_blocks, [&](size_t l, size_t sh, size_t k) -> absl::Status {
           const int read_id = static_cast<int>(header.remote_block_id + k);
+          size_t layer_bytes_per_block = delegate_->bytes_per_block(l);
           RETURN_IF_ERROR(ValidateBlockRange(
-              delegate_, l, sh, read_id, /*num_blocks=*/1, bytes_per_block));
+              delegate_, l, sh, read_id, /*num_blocks=*/1, layer_bytes_per_block));
           RETURN_IF_ERROR(delegate_->WaitForBlockRead(l, sh, read_id));
           const uint8_t* src_ptr =
               delegate_->GetBlockHostPointer(l, sh, read_id);
-          return WriteExact(client_fd, src_ptr, bytes_per_block);
+          return WriteExact(client_fd, src_ptr, layer_bytes_per_block);
         }));
   } else if (header.op == 3) {
     // Byte-range Resharding Pull Request!
@@ -406,6 +408,33 @@ absl::Status BlockTransport::ProcessSingleRequest(int client_fd) {
     ack = 1;
     RETURN_IF_ERROR(WriteExact(client_fd, &ack, 1));
     RETURN_IF_ERROR(delegate_->OnSingleBlockReceived(dst_id, size_bytes));
+  } else if (header.op == 5) {  // Segment Pull
+    size_t num_segments = header.num_blocks;
+    std::vector<int64_t> layers(num_segments);
+    std::vector<int64_t> src_offsets(num_segments);
+    std::vector<int64_t> dst_offsets(num_segments);
+    std::vector<int64_t> sizes(num_segments);
+
+    RETURN_IF_ERROR(ReadExact(client_fd, layers.data(), num_segments * sizeof(int64_t)));
+    RETURN_IF_ERROR(ReadExact(client_fd, src_offsets.data(), num_segments * sizeof(int64_t)));
+    RETURN_IF_ERROR(ReadExact(client_fd, dst_offsets.data(), num_segments * sizeof(int64_t)));
+    RETURN_IF_ERROR(ReadExact(client_fd, sizes.data(), num_segments * sizeof(int64_t)));
+
+    // Now wait for the segment copies to finish on the host
+    auto waiter = delegate_->GetLastSegmentWaiter();
+    if (waiter) {
+      waiter();
+    }
+
+    // Now write the payloads sequentially
+    for (size_t i = 0; i < num_segments; ++i) {
+      int64_t l = layers[i];
+      int64_t src_offset = src_offsets[i];
+      int64_t size = sizes[i];
+
+      const uint8_t* src_ptr = delegate_->GetBlockHostPointer(l, 0, 0) + src_offset;
+      RETURN_IF_ERROR(WriteExact(client_fd, src_ptr, size));
+    }
   }
   return absl::OkStatus();
 }
@@ -668,18 +697,16 @@ void BlockTransport::H2hWriteWorker(int stream_idx, const std::string& peer,
     allocated_ids[block_offset + k] = stream_allocated_ids[k];
   }
 
-  size_t bytes_per_block = delegate_->bytes_per_block();
-
   s = ForEachPayload(major_order, delegate_->num_layers(),
                      delegate_->num_shards(), block_count,
                      [&](size_t l, size_t sh, size_t k) -> absl::Status {
-      const uint8_t* base_host_ptr = delegate_->GetHostPointer(l, sh);
       ABSL_DCHECK_LT(block_offset + k, src_block_ids.size());
       const int src_id = src_block_ids[block_offset + k];
+      size_t layer_bytes_per_block = delegate_->bytes_per_block(l);
       RETURN_IF_ERROR(ValidateBlockRange(
-          delegate_, l, sh, src_id, /*num_blocks=*/1, bytes_per_block));
-      const uint8_t* src_ptr = base_host_ptr + src_id * bytes_per_block;
-      return WriteExact(fd, src_ptr, bytes_per_block);
+          delegate_, l, sh, src_id, /*num_blocks=*/1, layer_bytes_per_block));
+      const uint8_t* src_ptr = delegate_->GetBlockHostPointer(l, sh, src_id);
+      return WriteExact(fd, src_ptr, layer_bytes_per_block);
     });
   if (!s.ok()) {
     statuses[stream_idx] = s;
@@ -826,15 +853,18 @@ void BlockTransport::H2hReadWorker(
           return absl::InvalidArgumentError(
               "Destination block id is negative");
         }
+        size_t layer_bytes_per_block = delegate_->bytes_per_block(l);
         if (explicit_dst_ptrs.empty()) {
           RETURN_IF_ERROR(ValidateBlockRange(
-              delegate_, l, sh, dst_id, /*num_blocks=*/1, bytes_per_block));
+              delegate_, l, sh, dst_id, /*num_blocks=*/1, layer_bytes_per_block));
         }
-        uint8_t* dest_ptr = base_host_ptr + dst_id * bytes_per_block;
-        RETURN_IF_ERROR(ReadExact(fd, dest_ptr, bytes_per_block));
+        uint8_t* dest_ptr = explicit_dst_ptrs.empty()
+                                ? delegate_->GetBlockHostPointer(l, sh, dst_id)
+                                : base_host_ptr + dst_id * layer_bytes_per_block;
+        RETURN_IF_ERROR(ReadExact(fd, dest_ptr, layer_bytes_per_block));
         if (on_block_received) {
           RETURN_IF_ERROR(
-              on_block_received(l, sh, dst_id, bytes_per_block));
+              on_block_received(l, sh, dst_id, layer_bytes_per_block));
         }
         return absl::OkStatus();
       });
@@ -875,6 +905,49 @@ absl::Status BlockTransport::PullWeightsChunk(
   uint8_t* dest_ptr =
       delegate_->GetHostPointer(0, dst_shard_idx) + dst_offset_bytes;
   RETURN_IF_ERROR(ReadExact(fd, dest_ptr, size_bytes));
+
+  return absl::OkStatus();
+}
+
+absl::Status BlockTransport::PullSegments(
+    const std::string& peer,
+    const std::vector<int64_t>& layers,
+    const std::vector<int64_t>& src_offsets,
+    const std::vector<int64_t>& dst_offsets,
+    const std::vector<int64_t>& sizes,
+    const std::vector<uint8_t*>& explicit_dst_ptrs,
+    int parallelism) {
+  if (peer.empty()) {
+    return absl::InvalidArgumentError("Peer address cannot be empty");
+  }
+
+  // Establish peer socket connection
+  TF_ASSIGN_OR_RETURN(int fd, ConnectToPeer(peer));
+  auto cleanup = std::unique_ptr<int, void (*)(int*)>(&fd, [](int* p) {
+    if (p && *p >= 0) close(*p);
+  });
+
+  // Send segment pull header (op = 5)
+  BlockPacketHeader header = {};
+  header.op = 5;
+  header.num_blocks = static_cast<uint32_t>(layers.size());
+
+  RETURN_IF_ERROR(WriteExact(fd, &header, sizeof(header)));
+
+  // Write segment info
+  RETURN_IF_ERROR(WriteExact(fd, layers.data(), layers.size() * sizeof(int64_t)));
+  RETURN_IF_ERROR(WriteExact(fd, src_offsets.data(), src_offsets.size() * sizeof(int64_t)));
+  RETURN_IF_ERROR(WriteExact(fd, dst_offsets.data(), dst_offsets.size() * sizeof(int64_t)));
+  RETURN_IF_ERROR(WriteExact(fd, sizes.data(), sizes.size() * sizeof(int64_t)));
+
+  // Read payloads directly into local host staging buffers
+  for (size_t i = 0; i < layers.size(); ++i) {
+    int64_t l = layers[i];
+    int64_t dst_offset = dst_offsets[i];
+    int64_t size = sizes[i];
+    uint8_t* dest_ptr = explicit_dst_ptrs[l] + dst_offset;
+    RETURN_IF_ERROR(ReadExact(fd, dest_ptr, size));
+  }
 
   return absl::OkStatus();
 }

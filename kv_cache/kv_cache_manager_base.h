@@ -158,6 +158,14 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
       size_t layer_idx, const void* src_host_ptr, size_t src_size,
       const KVCacheCopySpec& copy_spec, size_t shard_idx = 0);
 
+  absl::StatusOr<raiden::PjRtCopyFuture> D2hSegment(
+      size_t layer_idx, size_t shard_idx, void* dst_host_ptr,
+      int64_t src_offset_bytes, int64_t size_bytes);
+
+  absl::StatusOr<raiden::PjRtCopyFuture> H2dSegment(
+      size_t layer_idx, size_t shard_idx, const void* src_host_ptr,
+      int64_t dst_offset_bytes, int64_t size_bytes);
+
   absl::Status ConfigureHostStagingSlots(int64_t num_slots,
                                          int64_t max_major_per_slot);
 
@@ -173,6 +181,13 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
       size_t layer_idx, int64_t slot_idx, int64_t num_major,
       const KVCacheCopySpec& copy_spec, size_t shard_idx = 0);
 
+  void SetLastSegmentWaiter(std::function<void()> waiter) {
+    last_segment_waiter_ = waiter;
+  }
+  std::function<void()> GetLastSegmentWaiter() override {
+    return last_segment_waiter_;
+  }
+
   void SetExternalHostBuffer(
       const std::vector<raiden::BufferHoldAndAlias>& buffer_holds);
 
@@ -180,6 +195,9 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
   LogicalBlockManager* block_manager() const { return block_manager_.get(); }
 
   size_t bytes_per_block() const override;
+  size_t bytes_per_block(size_t layer_idx) const override;
+  uint8_t* GetBlockHostPointer(size_t layer_idx, size_t shard_idx,
+                               int block_id) override;
 
  protected:
   const PJRT_Api* c_api_ = nullptr;
@@ -189,7 +207,11 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
   int64_t staging_max_major_per_slot_ = 0;
   bool is_blocked_layout_ = false;
 
+  std::vector<size_t> layer_slice_byte_sizes_;
+
   std::unique_ptr<LogicalBlockManager> block_manager_;
+
+  std::function<void()> last_segment_waiter_;
 
   // Separate PJRT active holds matrix to protect subclass scoping E2E!
   std::vector<std::vector<raiden::BufferHoldAndAlias>> buffer_holds_;

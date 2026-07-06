@@ -127,10 +127,23 @@ NB_MODULE(_transfer_engine, m) {
           nb::arg("host_pool"), nb::arg("tp_rank"))
       .def("notify_for_read", &TransferEngine::NotifyForRead, nb::arg("req_id"),
            nb::arg("uuid"), nb::arg("block_ids"))
-      .def("start_read", &TransferEngine::StartRead, nb::arg("req_id"),
-           nb::arg("uuid"), nb::arg("remote_endpoint"),
+      .def("start_read",
+           nb::overload_cast<const std::string&, uint64_t, const std::string&,
+                             const std::vector<int64_t>&, const std::vector<int64_t>&,
+                             int>(&TransferEngine::StartRead),
+           nb::arg("req_id"), nb::arg("uuid"), nb::arg("remote_endpoint"),
            nb::arg("remote_block_ids"), nb::arg("local_block_ids"),
            nb::arg("parallelism") = 1)
+      .def("start_read_segments",
+           nb::overload_cast<const std::string&, uint64_t, const std::string&,
+                             const std::vector<int64_t>&,
+                             const std::vector<int64_t>&, const std::vector<int64_t>&,
+                             const std::vector<int64_t>&, const std::vector<int64_t>&,
+                             int>(&TransferEngine::StartRead),
+           nb::arg("req_id"), nb::arg("uuid"), nb::arg("remote_endpoint"),
+           nb::arg("local_block_ids"),
+           nb::arg("layers"), nb::arg("src_offsets"), nb::arg("dst_offsets"),
+           nb::arg("sizes"), nb::arg("parallelism") = 1)
       .def(
           "stage_d2h",
           [](TransferEngine& self, int64_t slot_idx, int64_t num_blocks,

@@ -66,11 +66,15 @@ class BlockTransportDelegate {
 
   virtual uint8_t* GetBlockHostPointer(size_t layer_idx, size_t shard_idx,
                                        int block_id) {
-    return GetHostPointer(layer_idx, shard_idx) + block_id * bytes_per_block();
+    return GetHostPointer(layer_idx, shard_idx) + block_id * bytes_per_block(layer_idx);
   }
 
   virtual size_t bytes_per_block() const {
     return block_size() * slice_byte_size();
+  }
+
+  virtual size_t bytes_per_block(size_t layer_idx) const {
+    return bytes_per_block();
   }
 
   virtual int GetRemoteReadBlockId(int base_remote_id, int chunk_k) = 0;
@@ -80,6 +84,10 @@ class BlockTransportDelegate {
   virtual size_t slice_byte_size() const = 0;
   virtual int block_size() const = 0;
   virtual size_t shard_factor() const = 0;
+
+  virtual std::function<void()> GetLastSegmentWaiter() {
+    return nullptr;
+  }
 };
 
 // Standalone block-based POSIX TCP socket transport engine for TPU Raiden.
@@ -112,6 +120,15 @@ class BlockTransport {
       const std::vector<uint8_t*>& explicit_dst_ptrs = {}, int parallelism = 1,
       MajorOrder major_order = MajorOrder::kLayerMajor,
       BlockReceivedCallback on_block_received = {});
+
+  absl::Status PullSegments(
+      const std::string& peer,
+      const std::vector<int64_t>& layers,
+      const std::vector<int64_t>& src_offsets,
+      const std::vector<int64_t>& dst_offsets,
+      const std::vector<int64_t>& sizes,
+      const std::vector<uint8_t*>& explicit_dst_ptrs,
+      int parallelism);
 
   // Pull byte-range weights chunk directly (Resharding Pull)
   absl::Status PullWeightsChunk(const std::string& source, size_t src_shard_idx,

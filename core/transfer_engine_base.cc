@@ -367,6 +367,12 @@ TransferEngineBase::TransferEngineBase(
   }
   if (kv_transfer_) {
     ConfigureDataPortFromKvTransfer();
+    kv_transfer_->SetLastSegmentWaiter([this]() {
+      std::lock_guard<std::mutex> lock(mu_);
+      if (last_segment_future_) {
+        last_segment_future_->Await();
+      }
+    });
   }
   InitializeSlotPool(num_slots_);
   StartControlServer();
@@ -828,7 +834,7 @@ std::vector<kv_cache::KVCacheHostSpan> TransferEngineBase::LayerSpans(
     throw std::runtime_error("KV cache manager is not registered");
   }
   if (num_blocks < 0 || num_blocks > max_blocks_) {
-    throw std::out_of_range("num_blocks out of range");
+    throw std::out_of_range("num_blocks (" + std::to_string(num_blocks) + ") out of range of max_blocks_ (" + std::to_string(max_blocks_) + ")");
   }
   std::vector<kv_cache::KVCacheHostSpan> spans;
   spans.reserve(kv_transfer_->num_layers());
@@ -1064,6 +1070,8 @@ void TransferEngineBase::HandleControlConnection(int fd) {
     }
     if (req.op == kOpPullStream) {
       ProcessPullStream(fd, req);
+    } else if (req.op == kOpSegmentPullStream) {
+      ProcessSegmentPullStream(fd, req);
     } else {
       throw std::runtime_error("unknown control op code: " +
                                std::to_string(req.op));
@@ -1357,6 +1365,189 @@ std::vector<int> TransferEngineBase::ContiguousBlockIds(uint64_t base,
     ids.push_back(static_cast<int>(base + i));
   }
   return ids;
+}
+
+int64_t TransferEngineBase::StartRead(
+    const std::string& req_id, uint64_t uuid,
+    const std::string& remote_endpoint,
+    const std::vector<int64_t>& local_block_ids,
+    const std::vector<int64_t>& layers,
+    const std::vector<int64_t>& src_offsets,
+    const std::vector<int64_t>& dst_offsets,
+    const std::vector<int64_t>& sizes,
+    int parallelism) {
+  auto load_promise = std::make_shared<std::promise<void>>();
+  {
+    std::lock_guard<std::mutex> lock(worker_threads_mu_);
+    worker_threads_.emplace_back([this, req_id, uuid, remote_endpoint,
+                                  local_block_ids,
+                                  layers, src_offsets, dst_offsets, sizes,
+                                  load_promise, parallelism]() {
+      int64_t slot_idx = -1;
+      try {
+        if (layers.empty()) {
+          AckRemote(remote_endpoint, uuid);
+        } else {
+          slot_idx = AcquireSlot();
+
+          // Connect to the remote control port
+          int control_fd = ConnectTcp(remote_endpoint);
+          auto control_cleanup =
+              std::unique_ptr<int, void (*)(int*)>(&control_fd, [](int* p) {
+                if (p && *p >= 0) close(*p);
+              });
+
+          // Send segment pull request (op = 5)
+          ControlRequestHeader stream_request;
+          stream_request.magic = kControlMagic;
+          stream_request.op = kOpSegmentPullStream;
+          stream_request.uuid = uuid;
+          stream_request.num_blocks = static_cast<uint64_t>(layers.size());
+
+          CheckStatus("control segment pull stream write",
+                      WriteExact(control_fd, &stream_request, sizeof(stream_request)));
+
+          // Write the 4 vectors over the control channel
+          CheckStatus("control layers write", WriteExact(control_fd, layers.data(), layers.size() * sizeof(int64_t)));
+          CheckStatus("control src_offsets write", WriteExact(control_fd, src_offsets.data(), src_offsets.size() * sizeof(int64_t)));
+          CheckStatus("control dst_offsets write", WriteExact(control_fd, dst_offsets.data(), dst_offsets.size() * sizeof(int64_t)));
+          CheckStatus("control sizes write", WriteExact(control_fd, sizes.data(), sizes.size() * sizeof(int64_t)));
+
+          // Read response containing the data_port
+          ControlResponseHeader response = ReadControlResponseHeader(control_fd);
+
+          // Get local staging buffer pointers
+          std::vector<kv_cache::KVCacheHostSpan> local_spans = LayerSpans(slot_idx, max_blocks_);
+          std::vector<uint8_t*> explicit_dst_ptrs;
+          explicit_dst_ptrs.reserve(local_spans.size());
+          for (const auto& span : local_spans) {
+            explicit_dst_ptrs.push_back(span.ptr);
+          }
+
+          // Pull the segments over the data port connection
+          std::string data_endpoint = EndpointWithPort(remote_endpoint, response.data_port);
+          CheckStatus("data port segment pull",
+                      kv_transfer_->PullSegments(data_endpoint, layers, src_offsets,
+                                                 dst_offsets, sizes, explicit_dst_ptrs,
+                                                 parallelism));
+
+          // Run standard H2D copies asynchronously for the entire contiguous blocks
+          CopyPlan h2d_plan = BuildLoadCopyPlan(local_block_ids, local_block_ids);
+          kv_cache::KVCacheCopySpec h2d_transfer_spec = ToKVCacheCopySpec(h2d_plan.h2d_copy);
+          std::vector<kv_cache::KVCacheHostSpan> host_spans =
+              LayerSpans(slot_idx, local_block_ids.size());
+          auto h2d_future = std::make_shared<TransferFuture>();
+          for (const kv_cache::KVCacheHostSpan& span : host_spans) {
+            absl::StatusOr<raiden::PjRtCopyFuture> future_or =
+                kv_transfer_->H2dFromHostSlot(span.layer_idx, slot_idx,
+                                              local_block_ids.size(), h2d_transfer_spec,
+                                              span.shard_idx);
+            if (!future_or.ok()) {
+              throw std::runtime_error("H2dFromHostSlot failed: " + std::string(future_or.status().message()));
+            }
+            h2d_future->Add(std::move(future_or).value());
+          }
+
+          // Wait for all H2D copies to finish
+          h2d_future->Await();
+
+          // Write ACK back to the control server
+          ControlRequestHeader ack_request;
+          ack_request.magic = kControlMagic;
+          ack_request.op = kOpAck;
+          ack_request.uuid = uuid;
+          CheckStatus("control ack write", WriteExact(control_fd, &ack_request, sizeof(ack_request))); { std::lock_guard<std::mutex> lock(mu_); done_recving_.insert(req_id); }
+        }
+        load_promise->set_value();
+      } catch (const std::exception& e) {
+        LOG(ERROR) << "Raiden consumer segment pull error: " << e.what(); { std::lock_guard<std::mutex> lock(mu_); failed_recving_.insert(req_id); }
+        load_promise->set_exception(std::make_exception_ptr(e));
+      }
+
+      if (slot_idx >= 0) {
+        std::lock_guard<std::mutex> lock(mu_);
+        ReleaseSlotLocked(slot_idx);
+      }
+    });
+  }
+  return StorePending(PendingOperation{std::make_shared<TransferFuture>(), load_promise});
+}
+
+void TransferEngineBase::ProcessSegmentPullStream(int fd, const ControlRequestHeader& req) {
+  std::shared_ptr<SendEntry> entry;
+  {
+    std::unique_lock<std::mutex> lock(mu_);
+    cv_.wait(lock, [this, &entry, &req]() {
+      auto it = send_entries_.find(req.uuid);
+      if (it != send_entries_.end()) {
+        entry = it->second;
+        return true;
+      }
+      return stopping_.load();
+    });
+  }
+  if (stopping_ || !entry) return;
+
+  std::vector<int64_t> requested_block_ids = entry->registered_block_ids;
+
+  size_t num_segments = req.num_blocks;
+  std::vector<int64_t> layers(num_segments);
+  std::vector<int64_t> src_offsets(num_segments);
+  std::vector<int64_t> dst_offsets(num_segments);
+  std::vector<int64_t> sizes(num_segments);
+
+  CheckStatus("control stream segment layers read",
+              ReadExact(fd, layers.data(), num_segments * sizeof(int64_t)));
+  CheckStatus("control stream segment src_offsets read",
+              ReadExact(fd, src_offsets.data(), num_segments * sizeof(int64_t)));
+  CheckStatus("control stream segment dst_offsets read",
+              ReadExact(fd, dst_offsets.data(), num_segments * sizeof(int64_t)));
+  CheckStatus("control stream segment sizes read",
+              ReadExact(fd, sizes.data(), num_segments * sizeof(int64_t)));
+
+  int64_t slot_idx = AcquireSlot();
+
+  // Run standard block-level D2H copies asynchronously for the entire contiguous blocks
+  CopySpec d2h_copy = Offsets(requested_block_ids, /*source_is_compact=*/false);
+  kv_cache::KVCacheCopySpec d2h_transfer_spec = ToKVCacheCopySpec(d2h_copy);
+  std::vector<kv_cache::KVCacheHostSpan> host_spans =
+      LayerSpans(slot_idx, entry->registered_num_blocks);
+  auto d2h_future = std::make_shared<TransferFuture>();
+  for (const kv_cache::KVCacheHostSpan& span : host_spans) {
+    absl::StatusOr<raiden::PjRtCopyFuture> future_or =
+        kv_transfer_->D2hToHostSlot(span.layer_idx, slot_idx,
+                                    entry->registered_num_blocks, d2h_transfer_spec,
+                                    span.shard_idx);
+    if (!future_or.ok()) {
+      throw std::runtime_error("D2hToHostSlot failed");
+    }
+    d2h_future->Add(std::move(future_or).value());
+  }
+
+  // Assign the future so it is awaited on the data thread
+  {
+    std::lock_guard<std::mutex> lock(mu_);
+    last_segment_future_ = d2h_future;
+  }
+
+  // Send the ControlResponseHeader with the data_port
+  ControlResponseHeader response;
+  response.magic = kResponseMagic;
+  response.status = 0;
+  response.num_layers = kv_transfer_->num_layers();
+  response.data_port = static_cast<uint32_t>(local_data_port_);
+  CheckStatus("control stream response header write",
+              WriteExact(fd, &response, sizeof(response)));
+
+  // Wait for control ACK
+  ControlRequestHeader ack_req;
+  CheckStatus("control ack read", ReadExact(fd, &ack_req, sizeof(ack_req)));
+
+  // Release the acquired staging slot
+  {
+    std::lock_guard<std::mutex> lock(mu_);
+    ReleaseSlotLocked(slot_idx);
+  }
 }
 
 }  // namespace tpu_raiden

@@ -80,6 +80,15 @@ class RaidenManagerBase : public tpu_raiden::transport::BlockTransportDelegate {
                                 size_t src_offset_bytes, size_t dst_shard_idx,
                                 size_t dst_offset_bytes, size_t size_bytes);
 
+  absl::Status PullSegments(
+      const std::string& peer,
+      const std::vector<int64_t>& layers,
+      const std::vector<int64_t>& src_offsets,
+      const std::vector<int64_t>& dst_offsets,
+      const std::vector<int64_t>& sizes,
+      const std::vector<uint8_t*>& explicit_dst_ptrs,
+      int parallelism);
+
   std::optional<int> local_port() const;
 
   uint8_t* GetHostPointer(size_t layer_idx, size_t shard_idx) override;
@@ -98,6 +107,7 @@ class RaidenManagerBase : public tpu_raiden::transport::BlockTransportDelegate {
   size_t slice_byte_size() const override { return slice_byte_size_; }
   int block_size() const override { return block_size_; }
   size_t bytes_per_block() const override;
+  size_t bytes_per_block(size_t layer_idx) const override;
   size_t shard_factor() const override { return shard_factor_; }
   absl::Status WaitForBlockRead(size_t layer_idx, size_t shard_idx,
                                 int block_id) override;
