@@ -432,7 +432,7 @@ absl::Status BlockTransport::ProcessSingleRequest(int client_fd) {
       int64_t src_offset = src_offsets[i];
       int64_t size = sizes[i];
 
-      const uint8_t* src_ptr = delegate_->GetBlockHostPointer(l, 0, 0) + src_offset;
+      const uint8_t* src_ptr = delegate_->GetSegmentHostPointer(l, src_offset);
       RETURN_IF_ERROR(WriteExact(client_fd, src_ptr, size));
     }
   }

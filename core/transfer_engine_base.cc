@@ -367,6 +367,20 @@ TransferEngineBase::TransferEngineBase(
   }
   if (kv_transfer_) {
     ConfigureDataPortFromKvTransfer();
+    kv_transfer_->SetSegmentPointerResolver([this](size_t layer_idx, int64_t src_offset) -> const uint8_t* {
+      std::lock_guard<std::mutex> lock(mu_);
+      if (last_served_slot_idx_ < 0) return nullptr;
+      const auto& block_ids = last_served_block_ids_;
+      size_t bytes_per_block = kv_transfer_->bytes_per_block(layer_idx);
+      int64_t block_id = src_offset / bytes_per_block;
+      auto it = std::find(block_ids.begin(), block_ids.end(), block_id);
+      if (it == block_ids.end()) return nullptr;
+      int64_t index_in_slot = std::distance(block_ids.begin(), it);
+      int64_t compact_offset = index_in_slot * bytes_per_block + (src_offset % bytes_per_block);
+      auto span_or = kv_transfer_->HostSpan(layer_idx, 0, last_served_slot_idx_, block_ids.size());
+      if (!span_or.ok()) return nullptr;
+      return span_or.value().ptr + compact_offset;
+    });
     kv_transfer_->SetLastSegmentWaiter([this]() {
       std::lock_guard<std::mutex> lock(mu_);
       if (last_segment_future_) {
@@ -1528,6 +1542,8 @@ void TransferEngineBase::ProcessSegmentPullStream(int fd, const ControlRequestHe
   {
     std::lock_guard<std::mutex> lock(mu_);
     last_segment_future_ = d2h_future;
+    last_served_slot_idx_ = slot_idx;
+    last_served_block_ids_ = requested_block_ids;
   }
 
   // Send the ControlResponseHeader with the data_port

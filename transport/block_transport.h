@@ -69,6 +69,10 @@ class BlockTransportDelegate {
     return GetHostPointer(layer_idx, shard_idx) + block_id * bytes_per_block(layer_idx);
   }
 
+  virtual const uint8_t* GetSegmentHostPointer(size_t layer_idx, int64_t src_offset) {
+    return GetBlockHostPointer(layer_idx, 0, 0) + src_offset;
+  }
+
   virtual size_t bytes_per_block() const {
     return block_size() * slice_byte_size();
   }

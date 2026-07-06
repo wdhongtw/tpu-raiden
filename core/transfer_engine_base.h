@@ -308,6 +308,8 @@ class TransferEngineBase {
 
   std::unique_ptr<kv_cache::KVCacheManagerBase> kv_transfer_;
   std::shared_ptr<TransferFuture> last_segment_future_;
+  int64_t last_served_slot_idx_ = -1;
+  std::vector<int64_t> last_served_block_ids_;
   int64_t tp_rank_ = 0;
   int local_control_port_ = 0;
   int local_data_port_ = 0;

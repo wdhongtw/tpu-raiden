@@ -184,6 +184,18 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
   void SetLastSegmentWaiter(std::function<void()> waiter) {
     last_segment_waiter_ = waiter;
   }
+  std::function<const uint8_t*(size_t, int64_t)> segment_pointer_resolver_;
+
+  void SetSegmentPointerResolver(std::function<const uint8_t*(size_t, int64_t)> resolver) {
+    segment_pointer_resolver_ = resolver;
+  }
+  const uint8_t* GetSegmentHostPointer(size_t layer_idx, int64_t src_offset) override {
+    if (segment_pointer_resolver_) {
+      return segment_pointer_resolver_(layer_idx, src_offset);
+    }
+    return transport::BlockTransportDelegate::GetSegmentHostPointer(layer_idx, src_offset);
+  }
+
   std::function<void()> GetLastSegmentWaiter() override {
     return last_segment_waiter_;
   }
