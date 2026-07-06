@@ -970,7 +970,7 @@ void TransferEngineBase::StartControlServer() {
                              std::string(std::strerror(errno)));
   }
   int opt = 1;
-  setsockopt(control_fd_, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+  setsockopt(control_fd_, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)); setsockopt(control_fd_, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt));
   setsockopt(control_fd_, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
 
   sockaddr_in addr;
