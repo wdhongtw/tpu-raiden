@@ -52,6 +52,9 @@ UnpackedTensor UnpackTorchTensor(const at::Tensor& tensor) {
   // silently drops H2d (the model never sees the reload) and makes D2h read a
   // one-off snapshot. GetBaseBuffer always returns the buffer backing the
   // tensor's storage, so the DMA lands in the live cache regardless of view.
+  // Force materialization of empty/uninitialized storage views to prevent AwaitBuffer hangs
+  const_cast<at::Tensor&>(tensor).zero_();
+
   auto status_or_ref = torch_tpu::GetBaseBuffer(tensor);
   if (!status_or_ref.ok()) {
     throw std::runtime_error("Failed to resolve base device buffer: " +

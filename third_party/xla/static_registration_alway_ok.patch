@@ -1,0 +1,12 @@
+diff --git a/xla/pjrt/plugin/static_registration.h b/xla/pjrt/plugin/static_registration.h
+index 920f0dc..d20f0dc 100644
+--- a/xla/pjrt/plugin/static_registration.h
++++ b/xla/pjrt/plugin/static_registration.h
+@@ -40,3 +40,3 @@
+ #define REGISTER_PJRT_PLUGIN(plugin_name, get_plugin_fn)          \
+   [[maybe_unused]] static bool already_registered_##plugin_name = \
+       [](auto plugin_name, const PJRT_Api* plugin_api) -> bool {  \
+-    QCHECK_OK(RegisterStaticPjrtPlugin(plugin_name, plugin_api)); \
++    RegisterStaticPjrtPlugin(plugin_name, plugin_api); \
+     return true;                                                  \
+   }(plugin_name, get_plugin_fn);

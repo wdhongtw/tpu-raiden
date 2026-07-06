@@ -152,7 +152,7 @@ nanobind_extension(
     features = [
         "-use_header_modules",
     ],
-    linkopts = ["-Wl,--allow-shlib-undefined"],
+    linkopts = ["-Wl,--allow-shlib-undefined", "-Wl,-Bsymbolic"],
     visibility = ["//visibility:public"],
     deps = [
         ":kv_cache_manager_torch",
@@ -204,7 +204,7 @@ nanobind_extension(
     name = "_torch_raw_transfer",
     srcs = ["torch_raw_transfer_module.cc"],
     features = ["-use_header_modules"],
-    linkopts = ["-Wl,--allow-shlib-undefined"],
+    linkopts = ["-Wl,--allow-shlib-undefined", "-Wl,-Bsymbolic"],
     visibility = ["//visibility:public"],
     deps = [
         ":torch_nanobind_utils",
