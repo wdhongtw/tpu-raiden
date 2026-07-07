@@ -369,16 +369,22 @@ TransferEngineBase::TransferEngineBase(
     ConfigureDataPortFromKvTransfer();
     kv_transfer_->SetSegmentPointerResolver([this](size_t layer_idx, int64_t src_offset) -> const uint8_t* {
       std::lock_guard<std::mutex> lock(mu_);
-      if (last_served_slot_idx_ < 0) return nullptr;
+      if (last_served_slot_idx_ < 0) { fprintf(stderr, "Raiden GetSegmentHostPointer failed: last_served_slot_idx_ < 0\n"); return nullptr; }
       const auto& block_ids = last_served_block_ids_;
       size_t bytes_per_block = kv_transfer_->bytes_per_block(layer_idx);
       int64_t block_id = src_offset / bytes_per_block;
       auto it = std::find(block_ids.begin(), block_ids.end(), block_id);
-      if (it == block_ids.end()) return nullptr;
+
+      if (it == block_ids.end()) {
+        fprintf(stderr, "Raiden GetSegmentHostPointer failed: layer=%zu src_offset=%ld bytes_per_block=%zu block_id=%ld block_ids=[", layer_idx, src_offset, bytes_per_block, block_id);
+        for(int id: block_ids) fprintf(stderr, "%d ", id);
+        fprintf(stderr, "]\n");
+        return nullptr;
+      }
       int64_t index_in_slot = std::distance(block_ids.begin(), it);
       int64_t compact_offset = index_in_slot * bytes_per_block + (src_offset % bytes_per_block);
       auto span_or = kv_transfer_->HostSpan(layer_idx, 0, last_served_slot_idx_, block_ids.size());
-      if (!span_or.ok()) return nullptr;
+      if (!span_or.ok()) { fprintf(stderr, "Raiden GetSegmentHostPointer failed: span_or not ok: %s\n", span_or.status().message().data()); return nullptr; }
       return span_or.value().ptr + compact_offset;
     });
     kv_transfer_->SetLastSegmentWaiter([this]() {
@@ -1445,25 +1451,49 @@ int64_t TransferEngineBase::StartRead(
                                                  dst_offsets, sizes, explicit_dst_ptrs,
                                                  parallelism));
 
-          // Run standard H2D copies asynchronously for the entire contiguous blocks
-          CopyPlan h2d_plan = BuildLoadCopyPlan(local_block_ids, local_block_ids);
-          kv_cache::KVCacheCopySpec h2d_transfer_spec = ToKVCacheCopySpec(h2d_plan.h2d_copy);
-          std::vector<kv_cache::KVCacheHostSpan> host_spans =
-              LayerSpans(slot_idx, local_block_ids.size());
-          auto h2d_future = std::make_shared<TransferFuture>();
-          for (const kv_cache::KVCacheHostSpan& span : host_spans) {
-            absl::StatusOr<raiden::PjRtCopyFuture> future_or =
-                kv_transfer_->H2dFromHostSlot(span.layer_idx, slot_idx,
-                                              local_block_ids.size(), h2d_transfer_spec,
-                                              span.shard_idx);
-            if (!future_or.ok()) {
-              throw std::runtime_error("H2dFromHostSlot failed: " + std::string(future_or.status().message()));
+          // Run segment-level H2D copies asynchronously for the pulled segments
+          if (!layers.empty()) {
+            auto h2d_future = std::make_shared<TransferFuture>();
+            for (size_t i = 0; i < layers.size(); ++i) {
+              int64_t l = layers[i];
+              int64_t size = sizes[i];
+              size_t shard_idx = 0; // standard shard index
+              
+              size_t bytes_per_block = kv_transfer_->bytes_per_block(l);
+              int64_t local_block_slot_idx = dst_offsets[i] / bytes_per_block;
+              int64_t inner_offset = dst_offsets[i] % bytes_per_block;
+              int64_t physical_block_id = local_block_ids[local_block_slot_idx];
+              int64_t dst_offset_on_device = physical_block_id * bytes_per_block + inner_offset;
+              
+              const uint8_t* src_ptr = explicit_dst_ptrs[l] + dst_offsets[i];
+              
+              absl::StatusOr<raiden::PjRtCopyFuture> future_or =
+                  kv_transfer_->H2dSegment(l, shard_idx, src_ptr, dst_offset_on_device, size);
+              if (!future_or.ok()) {
+                throw std::runtime_error("H2dSegment failed: " + std::string(future_or.status().message()));
+              }
+              h2d_future->Add(std::move(future_or).value());
             }
-            h2d_future->Add(std::move(future_or).value());
+            h2d_future->Await();
+          } else {
+            // Run standard H2D copies asynchronously for the entire contiguous blocks
+            CopyPlan h2d_plan = BuildLoadCopyPlan(local_block_ids, local_block_ids);
+            kv_cache::KVCacheCopySpec h2d_transfer_spec = ToKVCacheCopySpec(h2d_plan.h2d_copy);
+            std::vector<kv_cache::KVCacheHostSpan> host_spans =
+                LayerSpans(slot_idx, local_block_ids.size());
+            auto h2d_future = std::make_shared<TransferFuture>();
+            for (const kv_cache::KVCacheHostSpan& span : host_spans) {
+              absl::StatusOr<raiden::PjRtCopyFuture> future_or =
+                  kv_transfer_->H2dFromHostSlot(span.layer_idx, slot_idx,
+                                                local_block_ids.size(), h2d_transfer_spec,
+                                                span.shard_idx);
+              if (!future_or.ok()) {
+                throw std::runtime_error("H2dFromHostSlot failed: " + std::string(future_or.status().message()));
+              }
+              h2d_future->Add(std::move(future_or).value());
+            }
+            h2d_future->Await();
           }
-
-          // Wait for all H2D copies to finish
-          h2d_future->Await();
 
           // Write ACK back to the control server
           ControlRequestHeader ack_request;
