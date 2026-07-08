@@ -308,7 +308,7 @@ NB_MODULE(_transfer_engine, m) {
       .def("register_host_buffers", &TransferEngine::RegisterHostBuffers,
            nb::arg("host_pool"), nb::arg("tp_rank"))
       .def("notify_for_read", &TransferEngine::NotifyForRead, nb::arg("req_id"),
-           nb::arg("uuid"), nb::arg("block_ids"))
+           nb::arg("uuid"), nb::arg("block_ids"), nb::arg("mamba_block_ids") = std::vector<int64_t>{})
       .def("start_read", &TransferEngine::StartRead, nb::arg("req_id"),
            nb::arg("uuid"), nb::arg("remote_endpoint"),
            nb::arg("remote_block_ids"), nb::arg("local_block_ids"),

@@ -36,6 +36,8 @@ class TransferEngine : public TransferEngineBase {
   std::vector<int64_t> RegisterKvCache(
       const std::vector<at::Tensor>& kv_caches);
 
+  void UpdateKvCache(const std::vector<at::Tensor>& kv_caches);
+
   void RegisterHostBuffers(int64_t tp_rank);
 
   const std::vector<at::Tensor>& kv_caches() const { return kv_caches_; }

@@ -370,9 +370,27 @@ TransferEngineBase::TransferEngineBase(
     kv_transfer_->SetSegmentPointerResolver([this](size_t layer_idx, int64_t src_offset) -> const uint8_t* {
       std::lock_guard<std::mutex> lock(mu_);
       if (last_served_slot_idx_ < 0) { fprintf(stderr, "Raiden GetSegmentHostPointer failed: last_served_slot_idx_ < 0\n"); return nullptr; }
-      const auto& block_ids = last_served_block_ids_;
       size_t bytes_per_block = kv_transfer_->bytes_per_block(layer_idx);
       int64_t block_id = src_offset / bytes_per_block;
+      fprintf(stderr, "RAIDEN_DEBUG GetSegmentHostPointer: layer=%zu src_offset=%lld bytes_per_block=%zu block_id=%lld\n",
+              layer_idx, (long long)src_offset, bytes_per_block, (long long)block_id);
+
+      bool is_mamba = (bytes_per_block < 50000);
+      if (layer_idx < last_served_mamba_block_ids_.size() && last_served_mamba_block_ids_[layer_idx] != -1) {
+        is_mamba = true;
+      }
+
+      if (is_mamba) {
+        int64_t compact_offset = src_offset % bytes_per_block;
+        auto span_or = kv_transfer_->HostSpan(layer_idx, 0, last_served_slot_idx_, 1);
+        if (!span_or.ok()) {
+          fprintf(stderr, "Raiden GetSegmentHostPointer failed (Mamba): span_or not ok: %s\n", span_or.status().message().data());
+          return nullptr;
+        }
+        return span_or.value().ptr + compact_offset;
+      }
+
+      const auto& block_ids = last_served_block_ids_;
       auto it = std::find(block_ids.begin(), block_ids.end(), block_id);
 
       if (it == block_ids.end()) {
@@ -422,9 +440,10 @@ int64_t TransferEngineBase::SubmitH2D(
 
 int64_t TransferEngineBase::NotifyForRead(
     const std::string& req_id, uint64_t uuid,
-    const std::vector<int64_t>& block_ids) {
+    const std::vector<int64_t>& block_ids,
+    const std::vector<int64_t>& mamba_block_ids) {
   const auto register_start = std::chrono::steady_clock::now();
-  if (block_ids.empty()) {
+  if (block_ids.empty() && mamba_block_ids.empty()) {
     return 0;
   }
 
@@ -443,6 +462,10 @@ int64_t TransferEngineBase::NotifyForRead(
   entry->registered_block_ids = block_ids;
   for (int64_t block_id : block_ids) {
     entry->registered_block_set.insert(block_id);
+  }
+  entry->registered_mamba_block_ids = mamba_block_ids;
+  for (int64_t block_id : mamba_block_ids) {
+    entry->registered_mamba_block_set.insert(block_id);
   }
   entry->deadline = DeadlineFromNow();
   entry->register_start = register_start;
@@ -1462,7 +1485,28 @@ int64_t TransferEngineBase::StartRead(
               size_t bytes_per_block = kv_transfer_->bytes_per_block(l);
               int64_t local_block_slot_idx = dst_offsets[i] / bytes_per_block;
               int64_t inner_offset = dst_offsets[i] % bytes_per_block;
-              int64_t physical_block_id = local_block_ids[local_block_slot_idx];
+              bool is_mamba = (bytes_per_block < 50000);
+              {
+                std::lock_guard<std::mutex> lock(mu_);
+                auto it = send_entries_.find(uuid);
+                if (it != send_entries_.end()) {
+                  const auto& mamba_ids = it->second->registered_mamba_block_ids;
+                  if (l < (int64_t)mamba_ids.size() && mamba_ids[l] != -1) {
+                    is_mamba = true;
+                  }
+                }
+              }
+              if (!is_mamba && (local_block_slot_idx < 0 || local_block_slot_idx >= (int64_t)local_block_ids.size())) {
+                throw std::out_of_range("local_block_slot_idx (" + std::to_string(local_block_slot_idx) 
+                                        + ") out of bounds of local_block_ids (size " 
+                                        + std::to_string(local_block_ids.size()) + ")! "
+                                        + "i=" + std::to_string(i) 
+                                        + ", l=" + std::to_string(l) 
+                                        + ", size=" + std::to_string(size) 
+                                        + ", bytes_per_block=" + std::to_string(bytes_per_block) 
+                                        + ", dst_offset=" + std::to_string(dst_offsets[i]));
+              }
+              int64_t physical_block_id = is_mamba ? local_block_ids.back() : local_block_ids[local_block_slot_idx];
               int64_t dst_offset_on_device = physical_block_id * bytes_per_block + inner_offset;
               
               const uint8_t* src_ptr = explicit_dst_ptrs[l] + dst_offsets[i];
@@ -1533,6 +1577,12 @@ void TransferEngineBase::ProcessSegmentPullStream(int fd, const ControlRequestHe
   if (stopping_ || !entry) return;
 
   std::vector<int64_t> requested_block_ids = entry->registered_block_ids;
+  std::string req_blocks_str = "";
+  for (int64_t id : requested_block_ids) {
+    req_blocks_str += std::to_string(id) + " ";
+  }
+  fprintf(stderr, "RAIDEN_DEBUG ProcessSegmentPullStream: uuid=%llu registered_num_blocks=%lld requested_block_ids=[%s]\n",
+          (unsigned long long)req.uuid, (long long)entry->registered_num_blocks, req_blocks_str.c_str());
 
   size_t num_segments = req.num_blocks;
   std::vector<int64_t> layers(num_segments);
@@ -1550,17 +1600,39 @@ void TransferEngineBase::ProcessSegmentPullStream(int fd, const ControlRequestHe
               ReadExact(fd, sizes.data(), num_segments * sizeof(int64_t)));
 
   int64_t slot_idx = AcquireSlot();
+  entry->slot_idx = slot_idx;
 
   // Run standard block-level D2H copies asynchronously for the entire contiguous blocks
   CopySpec d2h_copy = Offsets(requested_block_ids, /*source_is_compact=*/false);
   kv_cache::KVCacheCopySpec d2h_transfer_spec = ToKVCacheCopySpec(d2h_copy);
+
   std::vector<kv_cache::KVCacheHostSpan> host_spans =
       LayerSpans(slot_idx, entry->registered_num_blocks);
   auto d2h_future = std::make_shared<TransferFuture>();
   for (const kv_cache::KVCacheHostSpan& span : host_spans) {
+    bool is_mamba = (kv_transfer_->bytes_per_block(span.layer_idx) < 50000);
+    if (entry && span.layer_idx < entry->registered_mamba_block_ids.size() &&
+        entry->registered_mamba_block_ids[span.layer_idx] != -1) {
+      is_mamba = true;
+    }
+    fprintf(stderr, "RAIDEN_DEBUG ProcessSegmentPullStream layer=%zu is_mamba=%d bytes_per_block=%zu\n",
+            span.layer_idx, is_mamba, kv_transfer_->bytes_per_block(span.layer_idx));
+    CopySpec current_d2h_copy;
+    kv_cache::KVCacheCopySpec current_d2h_transfer_spec;
+    int64_t current_num_blocks = entry->registered_num_blocks;
+    if (is_mamba && !entry->registered_mamba_block_ids.empty() &&
+        static_cast<size_t>(span.layer_idx) < entry->registered_mamba_block_ids.size()) {
+      int64_t block_id = entry->registered_mamba_block_ids[span.layer_idx];
+      current_d2h_copy = Offsets({block_id}, /*source_is_compact=*/false);
+      current_d2h_transfer_spec = ToKVCacheCopySpec(current_d2h_copy);
+      current_num_blocks = 1;
+    } else {
+      current_d2h_copy = d2h_copy;
+      current_d2h_transfer_spec = d2h_transfer_spec;
+    }
     absl::StatusOr<raiden::PjRtCopyFuture> future_or =
         kv_transfer_->D2hToHostSlot(span.layer_idx, slot_idx,
-                                    entry->registered_num_blocks, d2h_transfer_spec,
+                                    current_num_blocks, current_d2h_transfer_spec,
                                     span.shard_idx);
     if (!future_or.ok()) {
       throw std::runtime_error("D2hToHostSlot failed");
@@ -1574,6 +1646,7 @@ void TransferEngineBase::ProcessSegmentPullStream(int fd, const ControlRequestHe
     last_segment_future_ = d2h_future;
     last_served_slot_idx_ = slot_idx;
     last_served_block_ids_ = requested_block_ids;
+    last_served_mamba_block_ids_ = entry->registered_mamba_block_ids;
   }
 
   // Send the ControlResponseHeader with the data_port
@@ -1589,11 +1662,7 @@ void TransferEngineBase::ProcessSegmentPullStream(int fd, const ControlRequestHe
   ControlRequestHeader ack_req;
   CheckStatus("control ack read", ReadExact(fd, &ack_req, sizeof(ack_req)));
 
-  // Release the acquired staging slot
-  {
-    std::lock_guard<std::mutex> lock(mu_);
-    ReleaseSlotLocked(slot_idx);
-  }
+  AckSend(req.uuid);
 }
 
 }  // namespace tpu_raiden

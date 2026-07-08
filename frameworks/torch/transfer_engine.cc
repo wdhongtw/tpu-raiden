@@ -24,6 +24,7 @@
 #include "ATen/core/TensorBody.h"
 #include "core/transfer_engine_base.h"
 #include "frameworks/torch/kv_cache_manager.h"
+#include "frameworks/torch/torch_utils.h"
 #include "kv_cache/kv_cache_manager_base.h"
 
 namespace tpu_raiden::torch {
@@ -103,6 +104,18 @@ std::vector<int64_t> TransferEngine::RegisterKvCache(
     region_ids.push_back(static_cast<int64_t>(i));
   }
   return region_ids;
+}
+
+void TransferEngine::UpdateKvCache(const TensorList& kv_caches) {
+  kv_caches_ = kv_caches;
+  if (!kv_transfer_) {
+    return;
+  }
+  auto unpacked_buffers = UnpackTorchTensors(SingleShardLayers(kv_caches_));
+  absl::Status status = kv_transfer_->UpdateDeviceBuffers(unpacked_buffers);
+  if (!status.ok()) {
+    throw std::runtime_error("UpdateDeviceBuffers failed: " + std::string(status.message()));
+  }
 }
 
 void TransferEngine::RegisterHostBuffers(int64_t tp_rank) {

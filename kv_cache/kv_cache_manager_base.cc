@@ -95,7 +95,8 @@ KVCacheManagerBase::KVCacheManagerBase(
   xla::PjRtBuffer* first_buffer = layer_buffers[0][0];
   const xla::Shape& shape = first_buffer->on_device_shape();
 
-  is_blocked_layout_ = (shape.dimensions().size() == 5);
+  is_blocked_layout_ = (shape.dimensions().size() >= 4 || shape.dimensions().size() == 2);
+  unsafe_skip_buffer_lock_ = unsafe_skip_buffer_lock;
 
   physical_size_ = first_buffer->GetOnDeviceSizeInBytes().value();
   extension_ = raiden::GetRawBufferExtension(first_buffer, &c_api_);
@@ -107,6 +108,8 @@ KVCacheManagerBase::KVCacheManagerBase(
         is_blocked_layout_ ? major_dim_size_ : (major_dim_size_ / block_size_);
     block_manager_ = std::make_unique<LogicalBlockManager>(total_blocks);
   }
+  fprintf(stderr, "RAIDEN_DEBUG Initialize: this=%p shape=%s is_blocked_layout=%d total_blocks=%d block_size=%d\n",
+          (void*)this, shape.ToString().c_str(), is_blocked_layout_, total_blocks, block_size_);
 
   int num_host_blocks = host_blocks_to_allocate.value_or(64);
   if (external_host_ptrs.has_value()) {
@@ -132,6 +135,8 @@ KVCacheManagerBase::KVCacheManagerBase(
       }
     }
     layer_slice_byte_sizes_.push_back(current_slice_byte_size);
+    fprintf(stderr, "RAIDEN_DEBUG Initialize layer=%zu slice_bytes=%zu bytes_per_block=%zu\n",
+            layer_idx, current_slice_byte_size, bytes_per_block(layer_idx));
 
     LayerInfoBase layer_info;
     layer_info.shards.reserve(num_shards_);
@@ -140,6 +145,7 @@ KVCacheManagerBase::KVCacheManagerBase(
 
     for (size_t i = 0; i < num_shards_; ++i) {
       xla::PjRtBuffer* dst_buffer = dst_buffers[i];
+      fprintf(stderr, "RAIDEN_DEBUG Warmup layer=%zu shard=%zu buf=%p\n", layer_idx, i, (void*)dst_buffer);
       ShardBufferInfoBase shard_info;
 
       shard_info.device_size = dst_buffer->GetOnDeviceSizeInBytes().value();
@@ -148,7 +154,7 @@ KVCacheManagerBase::KVCacheManagerBase(
             "Device buffer shard size smaller than physical size");
       }
 
-      size_t alloc_size = num_host_blocks * bytes_per_block();
+      size_t alloc_size = num_host_blocks * bytes_per_block(layer_idx);
       if (external_host_ptrs.has_value()) {
         if (shard_idx < external_host_ptrs->size()) {
           shard_info.host_ptr = (*external_host_ptrs)[shard_idx];
@@ -228,7 +234,7 @@ KVCacheManagerBase::KVCacheManagerBase(
       ShardBufferInfoBase shard_info;
 
       int num_host_blocks = host_blocks_to_allocate.value_or(0);
-      size_t alloc_size = num_host_blocks * bytes_per_block();
+      size_t alloc_size = num_host_blocks * bytes_per_block(layer_idx);
       if (host_allocator) {
         auto status_or_allocation = host_allocator(alloc_size);
         if (!status_or_allocation.ok()) {
@@ -531,6 +537,30 @@ void KVCacheManagerBase::SetExternalHostBuffer(
   }
 }
 
+absl::Status KVCacheManagerBase::UpdateDeviceBuffers(
+    const std::vector<std::vector<xla::PjRtBuffer*>>& layer_buffers) {
+  fprintf(stderr, "RAIDEN_DEBUG UpdateDeviceBuffers this=%p\n", (void*)this);
+  if (layer_buffers.size() != num_layers_) {
+    return absl::InvalidArgumentError("Number of layers mismatch in UpdateDeviceBuffers");
+  }
+  for (size_t l = 0; l < num_layers_; ++l) {
+    if (layer_buffers[l].size() != num_shards_) {
+      return absl::InvalidArgumentError("Number of shards mismatch in UpdateDeviceBuffers");
+    }
+    for (size_t sh = 0; sh < num_shards_; ++sh) {
+      xla::PjRtBuffer* new_buf = layer_buffers[l][sh];
+      fprintf(stderr, "RAIDEN_DEBUG Update layer=%zu shard=%zu new_buf=%p\n", l, sh, (void*)new_buf);
+      auto status_or_hold = raiden::BufferHoldAndAlias::Acquire(
+          new_buf, c_api_, extension_, unsafe_skip_buffer_lock_);
+      if (!status_or_hold.ok()) {
+        return status_or_hold.status();
+      }
+      buffer_holds_[l][sh] = std::move(status_or_hold).value();
+    }
+  }
+  return absl::OkStatus();
+}
+
 absl::Status KVCacheManagerBase::H2dDirect(
     stream_executor::Stream* stream,
     const std::vector<uint8_t*>& device_buffers,
@@ -697,6 +727,17 @@ absl::StatusOr<raiden::PjRtCopyFuture> KVCacheManagerBase::D2hDirect(
 absl::StatusOr<raiden::PjRtCopyFuture> KVCacheManagerBase::D2hTo(
     size_t layer_idx, void* dst_host_ptr, size_t dst_size,
     const KVCacheCopySpec& copy_spec, size_t shard_idx) {
+  std::string src_off_str = "";
+  std::string dst_off_str = "";
+  std::string size_str = "";
+  for (size_t i = 0; i < copy_spec.src_offsets.size(); ++i) {
+    src_off_str += std::to_string(copy_spec.src_offsets[i]) + " ";
+    dst_off_str += std::to_string(copy_spec.dst_offsets[i]) + " ";
+    size_str += std::to_string(copy_spec.sizes[i]) + " ";
+  }
+  fprintf(stderr, "RAIDEN_DEBUG D2hTo details: layer=%zu dst_size=%zu src_offsets=[%s] dst_offsets=[%s] sizes=[%s]\n",
+          layer_idx, dst_size, src_off_str.c_str(), dst_off_str.c_str(), size_str.c_str());
+  fprintf(stderr, "RAIDEN_DEBUG D2hTo this=%p layer=%zu shard=%zu\n", (void*)this, layer_idx, shard_idx);
   // TODO: Long-term, KVCacheManager should own host buffers for prefix cache.
   TF_RETURN_IF_ERROR(ValidateCopySpecStatus(copy_spec));
   if (layer_idx >= layers_.size() ||
@@ -749,6 +790,31 @@ absl::StatusOr<raiden::PjRtCopyFuture> KVCacheManagerBase::D2hTo(
       }
       futures.push_back(shard_hold.CopyRawDeviceToHost(
           dst + dst_offset, src_offset, size_to_copy));
+    }
+  }
+
+  // Wait for copies to complete and check host buffer contents
+  for (size_t i = 0; i < futures.size(); ++i) {
+    auto status = futures[i].Await();
+    if (!status.ok()) {
+      fprintf(stderr, "RAIDEN_DEBUG CopyRawDeviceToHost failed status=%s\n", std::string(status.message()).c_str());
+    }
+  }
+  if (is_partial) {
+    uint8_t* dst = static_cast<uint8_t*>(dst_host_ptr);
+    for (size_t i = 0; i < copy_spec.src_offsets.size(); ++i) {
+      const size_t slice_bytes = layer_slice_byte_sizes_[layer_idx];
+      const int64_t dst_offset = copy_spec.dst_offsets[i] * slice_bytes;
+      const int64_t size_to_copy = copy_spec.sizes[i] * slice_bytes;
+      uint8_t* ptr = dst + dst_offset;
+      size_t non_zero_count = 0;
+      for (int64_t j = 0; j < size_to_copy; ++j) {
+        if (ptr[j] != 0) {
+          non_zero_count++;
+        }
+      }
+      fprintf(stderr, "RAIDEN_DEBUG D2hTo Done: layer=%zu block_id=%lld dst_offset=%lld non_zero_bytes=%zu/%zu\n",
+              layer_idx, (long long)copy_spec.src_offsets[i], (long long)dst_offset, non_zero_count, (size_t)size_to_copy);
     }
   }
 
@@ -940,6 +1006,7 @@ absl::StatusOr<raiden::PjRtCopyFuture> KVCacheManagerBase::D2hSegment(
 absl::StatusOr<raiden::PjRtCopyFuture> KVCacheManagerBase::H2dSegment(
     size_t layer_idx, size_t shard_idx, const void* src_host_ptr,
     int64_t dst_offset_bytes, int64_t size_bytes) {
+  fprintf(stderr, "RAIDEN_DEBUG H2dSegment this=%p layer=%zu shard=%zu\n", (void*)this, layer_idx, shard_idx);
   if (layer_idx >= layers_.size() || shard_idx >= layers_[layer_idx].shards.size()) {
     return absl::InvalidArgumentError("Invalid layer or shard index");
   }
@@ -947,6 +1014,24 @@ absl::StatusOr<raiden::PjRtCopyFuture> KVCacheManagerBase::H2dSegment(
   std::vector<xla::Future<>> futures = {
       shard_hold.CopyRawHostToDevice(src_host_ptr, dst_offset_bytes, size_bytes)
   };
+
+  // Wait for copies to complete and check incoming host buffer contents
+  for (size_t i = 0; i < futures.size(); ++i) {
+    auto status = futures[i].Await();
+    if (!status.ok()) {
+      fprintf(stderr, "RAIDEN_DEBUG CopyRawHostToDevice failed status=%s\n", std::string(status.message()).c_str());
+    }
+  }
+  const uint8_t* ptr = static_cast<const uint8_t*>(src_host_ptr);
+  size_t non_zero_count = 0;
+  for (int64_t j = 0; j < size_bytes; ++j) {
+    if (ptr[j] != 0) {
+      non_zero_count++;
+    }
+  }
+  fprintf(stderr, "RAIDEN_DEBUG H2dSegment Done: layer=%zu dst_offset=%lld non_zero_bytes=%zu/%zu\n",
+          layer_idx, (long long)dst_offset_bytes, non_zero_count, (size_t)size_bytes);
+
   std::vector<xla::Future<raiden::BufferHolder>> shard_futures_to_join = {
       raiden::CreateBufferFuture(std::move(futures), shard_hold.c_hold,
                                  shard_hold.common_hold)};

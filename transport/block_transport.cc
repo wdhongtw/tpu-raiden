@@ -433,6 +433,14 @@ absl::Status BlockTransport::ProcessSingleRequest(int client_fd) {
       int64_t size = sizes[i];
 
       const uint8_t* src_ptr = delegate_->GetSegmentHostPointer(l, src_offset);
+      size_t non_zero_count = 0;
+      if (src_ptr) {
+        for (int64_t j = 0; j < size; ++j) {
+          if (src_ptr[j] != 0) non_zero_count++;
+        }
+      }
+      fprintf(stderr, "RAIDEN_DEBUG Write Segment: layer=%lld src_offset=%lld size=%lld non_zero_bytes=%zu/%zu\n",
+              (long long)l, (long long)src_offset, (long long)size, non_zero_count, (size_t)size);
       RETURN_IF_ERROR(WriteExact(client_fd, src_ptr, size));
     }
   }

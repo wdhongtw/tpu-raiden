@@ -145,7 +145,8 @@ class TransferEngineBase {
                     const std::vector<int64_t>& local_block_ids);
 
   int64_t NotifyForRead(const std::string& req_id, uint64_t uuid,
-                        const std::vector<int64_t>& block_ids);
+                        const std::vector<int64_t>& block_ids,
+                        const std::vector<int64_t>& mamba_block_ids = {});
 
   int64_t StartRead(const std::string& req_id, uint64_t uuid,
                     const std::string& remote_endpoint,
@@ -216,6 +217,8 @@ class TransferEngineBase {
     int64_t copy_segments = 0;
     std::vector<int64_t> registered_block_ids;
     std::set<int64_t> registered_block_set;
+    std::vector<int64_t> registered_mamba_block_ids;
+    std::set<int64_t> registered_mamba_block_set;
     std::chrono::steady_clock::time_point register_start;
     std::chrono::steady_clock::time_point d2h_issue_start;
     std::chrono::steady_clock::time_point d2h_issue_done;
@@ -310,6 +313,7 @@ class TransferEngineBase {
   std::shared_ptr<TransferFuture> last_segment_future_;
   int64_t last_served_slot_idx_ = -1;
   std::vector<int64_t> last_served_block_ids_;
+  std::vector<int64_t> last_served_mamba_block_ids_;
   int64_t tp_rank_ = 0;
   int local_control_port_ = 0;
   int local_data_port_ = 0;

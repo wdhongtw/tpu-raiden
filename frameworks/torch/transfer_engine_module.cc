@@ -119,6 +119,8 @@ NB_MODULE(_transfer_engine, m) {
       .def_prop_ro("local_data_port", &TransferEngine::local_data_port)
       .def("register_kv_cache", &TransferEngine::RegisterKvCache,
            nb::arg("kv_caches"))
+      .def("update_kv_cache", &TransferEngine::UpdateKvCache,
+           nb::arg("kv_caches"))
       .def(
           "register_host_buffers",
           [](TransferEngine& self, nb::object /*host_pool*/, int64_t tp_rank) {
@@ -126,7 +128,7 @@ NB_MODULE(_transfer_engine, m) {
           },
           nb::arg("host_pool"), nb::arg("tp_rank"))
       .def("notify_for_read", &TransferEngine::NotifyForRead, nb::arg("req_id"),
-           nb::arg("uuid"), nb::arg("block_ids"))
+           nb::arg("uuid"), nb::arg("block_ids"), nb::arg("mamba_block_ids") = std::vector<int64_t>{})
       .def("start_read",
            nb::overload_cast<const std::string&, uint64_t, const std::string&,
                              const std::vector<int64_t>&, const std::vector<int64_t>&,

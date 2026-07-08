@@ -203,6 +203,9 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
   void SetExternalHostBuffer(
       const std::vector<raiden::BufferHoldAndAlias>& buffer_holds);
 
+  absl::Status UpdateDeviceBuffers(
+      const std::vector<std::vector<xla::PjRtBuffer*>>& layer_buffers);
+
   // Returns the internal LogicalBlockManager.
   LogicalBlockManager* block_manager() const { return block_manager_.get(); }
 
@@ -218,6 +221,7 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
   int64_t staging_num_slots_ = 0;
   int64_t staging_max_major_per_slot_ = 0;
   bool is_blocked_layout_ = false;
+  bool unsafe_skip_buffer_lock_ = false;
 
   std::vector<size_t> layer_slice_byte_sizes_;
 
