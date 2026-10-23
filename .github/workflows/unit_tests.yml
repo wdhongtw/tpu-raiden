@@ -45,14 +45,13 @@ jobs:
     runs-on: linux-x86-n2-32
     container:
       image: us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build:latest@sha256:9644db6e0e969079b138547dd99818c02e6ab51d892c4675cf2f4edf02a1e71a
-      options: --shm-size=16g
+      options: --shm-size=16g -v /var/cache/tpu-raiden-bazel:/bazel_cache
     timeout-minutes: 300
     env:
       RAIDEN_TEST_SCOPE: ${{ inputs.test_scope || '//tpu_sync/core:all //tpu_sync/kv_cache:all //tpu_sync/weight_sync:all //tpu_sync/rpc:all' }}
-      # Fork PRs run without the ambient GCP service account, so the
-      # remote cache is only requested when the head branch lives in this
-      # repository.
-      EXTRA_BAZEL_FLAGS: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && '--config=ci' || '' }}
+      # Fork PRs and fork repositories run without the upstream RBE service
+      # account, so the remote cache is only requested on google/tpu-sync.
+      EXTRA_BAZEL_FLAGS: --output_filter=^$ --show_progress_rate_limit=5 ${{ github.repository == 'google/tpu-sync' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && '--config=ci' || '' }}
     steps:
       - name: Checkout tpu-sync
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09  # v5.1.0
@@ -72,6 +71,10 @@ jobs:
       - name: Run CPU unit tests, E2E JAX build, and binding verification
         working-directory: tpu-sync
         run: |
-          export BAZEL_CACHE_DIR="${RUNNER_TEMP}/bazel_cache"
+          if [[ -d /bazel_cache && -w /bazel_cache ]]; then
+            export BAZEL_CACHE_DIR="/bazel_cache"
+          else
+            export BAZEL_CACHE_DIR="${RUNNER_TEMP}/bazel_cache"
+          fi
           export BAZEL_OUTPUT_BASE="${BAZEL_CACHE_DIR}/output_base"
           bash ci/run_unit_tests.sh

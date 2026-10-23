@@ -135,6 +135,7 @@ jobs:
     runs-on: linux-x86-n2-32
     container:
       image: us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build:latest@sha256:9644db6e0e969079b138547dd99818c02e6ab51d892c4675cf2f4edf02a1e71a
+      options: -v /var/cache/tpu-raiden-bazel:/bazel_cache
     timeout-minutes: 300
     steps:
       - name: Checkout tpu-sync
@@ -155,9 +156,13 @@ jobs:
           WHEEL_VERSION_EXTRAS: ${{ needs.verify.outputs.wheel_version_extras }}
           INPUT_JAX_VERSION: ${{ inputs.jax_version }}
           INPUT_TORCH_ABIS: ${{ inputs.torch_abis }}
-          EXTRA_BAZEL_FLAGS: ${{ (inputs.use_remote_cache || 'yes') == 'yes' && '--config=ci' || '' }}
+          EXTRA_BAZEL_FLAGS: --output_filter=^$ --show_progress_rate_limit=5 ${{ (inputs.use_remote_cache || (github.repository == 'google/tpu-sync' && 'yes' || 'no')) == 'yes' && '--config=ci' || '' }}
         run: |
-          export BAZEL_CACHE_DIR="${RUNNER_TEMP}/bazel_cache"
+          if [[ -d /bazel_cache && -w /bazel_cache ]]; then
+            export BAZEL_CACHE_DIR="/bazel_cache"
+          else
+            export BAZEL_CACHE_DIR="${RUNNER_TEMP}/bazel_cache"
+          fi
           # Tag builds take the script's default JAX version and torch release
           # list; a dispatch may override them.
           if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then

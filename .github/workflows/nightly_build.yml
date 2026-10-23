@@ -122,6 +122,7 @@ jobs:
     runs-on: linux-x86-n2-32
     container:
       image: us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build:latest@sha256:9644db6e0e969079b138547dd99818c02e6ab51d892c4675cf2f4edf02a1e71a
+      options: -v /var/cache/tpu-raiden-bazel:/bazel_cache
     timeout-minutes: 300
     steps:
       - name: Checkout tpu-sync
@@ -141,9 +142,13 @@ jobs:
           BUILD_MODE: ${{ matrix.framework }}
           RAIDEN_JAX_VERSION: ${{ matrix.framework == 'jax' && inputs.jax_version || '' }}
           WHEEL_VERSION_EXTRAS: ${{ needs.version.outputs.wheel_version_extras }}
-          EXTRA_BAZEL_FLAGS: ${{ (inputs.use_remote_cache || 'yes') == 'yes' && '--config=ci' || '' }}
+          EXTRA_BAZEL_FLAGS: --output_filter=^$ --show_progress_rate_limit=5 ${{ (inputs.use_remote_cache || (github.repository == 'google/tpu-sync' && 'yes' || 'no')) == 'yes' && '--config=ci' || '' }}
         run: |
-          export BAZEL_CACHE_DIR="${RUNNER_TEMP}/bazel_cache"
+          if [[ -d /bazel_cache && -w /bazel_cache ]]; then
+            export BAZEL_CACHE_DIR="/bazel_cache"
+          else
+            export BAZEL_CACHE_DIR="${RUNNER_TEMP}/bazel_cache"
+          fi
           bash ci/build_wheel_impl.sh
       - name: Check wheel metadata
         working-directory: tpu-sync
@@ -191,8 +196,8 @@ jobs:
   upload:
     name: "Upload wheels to Artifact Registry"
     needs: [version, build]
-    # Scheduled nightlies always publish; manual dispatches only on request.
-    if: github.event_name == 'schedule' || inputs.upload_to_registry == 'yes'
+    # Scheduled nightlies always publish on upstream; manual dispatches only on request.
+    if: (github.event_name == 'schedule' && github.repository == 'google/tpu-sync') || inputs.upload_to_registry == 'yes'
     runs-on: linux-x86-n2-32
     container:
       image: us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build:latest@sha256:9644db6e0e969079b138547dd99818c02e6ab51d892c4675cf2f4edf02a1e71a
@@ -222,7 +227,7 @@ jobs:
   publish:
     name: "Publish"
     needs: [version, build]
-    if: github.event_name == 'schedule' || inputs.publish_to_pypi == 'yes'
+    if: (github.event_name == 'schedule' && github.repository == 'google/tpu-sync') || inputs.publish_to_pypi == 'yes'
     uses: ./.github/workflows/publish_pypi.yml
     with:
       artifact_pattern: nightly-wheel-*
