@@ -1,0 +1,184 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Builds the tpu-sync-torch wheel inside the ml-build container on the
+# self-hosted GCE runner (linux-x86-n2-64 / linux-x86-n2-32) with a persistent
+# host-mounted Bazel cache (/var/cache/tpu-raiden-bazel) and uploads the
+# resulting wheel as a workflow artifact.
+
+name: Build Torch Wheel
+
+on:
+  push:
+    branches:
+      - main
+      - "partner/**"
+      - "wdhongtw/**"
+      - "connector-*"
+      - "raiden-*"
+      - "ci/**"
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      torch_abis:
+        description: "Torch releases the torch wheel ships an extension variant for, space-separated, primary first"
+        required: false
+        default: "2.11.0 2.12.0 2.13.0"
+        type: string
+      wheel_version_extras:
+        description: "Optional version suffix override (empty = .dev<UTC timestamp>)"
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build_torch_wheel:
+    name: "Build tpu-sync-torch wheel"
+    runs-on: linux-x86-n2-32
+    container:
+      image: us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build:latest@sha256:dddf008479144c57182b56a6d00bfc1f38f8f2ef206e2bc26ff6c0a401ded47e
+      options: -v /var/cache/tpu-raiden-bazel:/bazel_cache
+    timeout-minutes: 300
+    steps:
+      - name: Checkout tpu-sync
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09  # v5.1.0
+        with:
+          persist-credentials: false
+          path: tpu-sync
+
+      - name: Fix Git Workspace Ownership
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE/tpu-sync"
+
+      - name: Stamp wheel version
+        id: stamp
+        working-directory: tpu-sync
+        env:
+          INPUT_EXTRAS: ${{ inputs.wheel_version_extras }}
+        run: |
+          BASE_VERSION=$(sed -n -E 's/^version = "(.*)"/\1/p' pyproject.toml | head -1)
+          if [[ -n "${INPUT_EXTRAS}" ]]; then
+            EXTRAS="${INPUT_EXTRAS}"
+          else
+            EXTRAS=".dev$(date -u +%Y%m%d%H%M%S)"
+          fi
+          echo "wheel_version_extras=${EXTRAS}" >> "$GITHUB_OUTPUT"
+          echo "version=${BASE_VERSION}${EXTRAS}" >> "$GITHUB_OUTPUT"
+          echo "Building tpu-sync-torch version: ${BASE_VERSION}${EXTRAS}"
+
+      - name: Build tpu-sync-torch wheel
+        shell: bash
+        working-directory: tpu-sync
+        env:
+          BUILD_MODE: torch
+          WHEEL_VERSION_EXTRAS: ${{ steps.stamp.outputs.wheel_version_extras }}
+          RAIDEN_TORCH_ABIS: ${{ inputs.torch_abis || '2.11.0 2.12.0 2.13.0' }}
+          EXTRA_BAZEL_FLAGS: --output_filter=^$ --show_progress_rate_limit=5 ${{ github.repository == 'google/tpu-sync' && '--config=ci' || '' }}
+        run: |
+          if [[ -d /bazel_cache && -w /bazel_cache ]]; then
+            export BAZEL_CACHE_DIR="/bazel_cache"
+          else
+            export BAZEL_CACHE_DIR="${RUNNER_TEMP}/bazel_cache"
+          fi
+          export BAZEL_OUTPUT_BASE="${BAZEL_CACHE_DIR}/output_base"
+          bash ci/build_wheel_impl.sh
+
+      - name: Check wheel metadata and summarize
+        id: meta
+        working-directory: tpu-sync
+        env:
+          WHEEL_VERSION_EXTRAS: ${{ steps.stamp.outputs.wheel_version_extras }}
+        run: |
+          tr -d '\r\n ' < torch_tpu.version > dist/torch_tpu_version.txt
+          uv run --isolated --with twine twine check dist/*"${WHEEL_VERSION_EXTRAS}"-*.whl
+          WHEEL_PATH=$(ls dist/tpu_sync_torch-*"${WHEEL_VERSION_EXTRAS}"-*.whl | head -1)
+          WHEEL_NAME=$(basename "${WHEEL_PATH}")
+          echo "wheel_name=${WHEEL_NAME}" >> "$GITHUB_OUTPUT"
+
+      - name: Publish wheel to GitHub Releases
+        if: github.event_name != 'pull_request'
+        working-directory: tpu-sync
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.stamp.outputs.version }}
+          WHEEL_NAME: ${{ steps.meta.outputs.wheel_name }}
+          TORCH_ABIS: ${{ inputs.torch_abis || '2.11.0 2.12.0 2.13.0' }}
+        run: |
+          TAG="v${VERSION}"
+          TORCH_TPU_VER="$(cat dist/torch_tpu_version.txt)"
+          DIRECT_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/releases/download/${TAG}/${WHEEL_NAME}"
+          FIND_LINKS_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/releases/expanded_assets/wheels"
+
+          NOTES="$(
+            echo "### \`tpu-sync-torch\` \`${VERSION}\`"
+            echo "- **Commit**: \`${GITHUB_SHA}\` (\`${GITHUB_REF_NAME}\`)"
+            echo "- **Paired \`torch_tpu\`**: \`${TORCH_TPU_VER}\`"
+            echo "- **Torch ABIs**: \`${TORCH_ABIS}\`"
+            echo ""
+            echo "#### Direct \`pip install\`"
+            echo '```bash'
+            echo "pip install ${DIRECT_URL}"
+            echo '```'
+            echo ""
+            echo "#### Version-pinned \`pip install --find-links\`"
+            echo '```bash'
+            echo "pip install \"tpu-sync-torch==${VERSION}\" \\"
+            echo "  --find-links ${FIND_LINKS_URL}"
+            echo '```'
+          )"
+
+          # 1. Create per-build pre-release with the raw .whl asset
+          gh release create "${TAG}" \
+            "dist/${WHEEL_NAME}" \
+            "dist/torch_tpu_version.txt" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --target "${GITHUB_SHA}" \
+            --title "tpu-sync-torch ${VERSION}" \
+            --notes "${NOTES}" \
+            --prerelease
+
+          # 2. Also upload the raw .whl to the rolling 'wheels' release for --find-links discovery
+          if ! gh release view wheels --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            ROLLING_NOTES="$(
+              echo "Rolling index of built \`tpu-sync-torch\` wheels. Install any version with:"
+              echo '```bash'
+              echo "pip install \"tpu-sync-torch==<version>\" \\"
+              echo "  --find-links ${FIND_LINKS_URL}"
+              echo '```'
+            )"
+            gh release create wheels \
+              --repo "${GITHUB_REPOSITORY}" \
+              --target "${GITHUB_SHA}" \
+              --title "tpu-sync-torch Rolling Wheel Index" \
+              --notes "${ROLLING_NOTES}" \
+              --prerelease
+          fi
+          gh release upload wheels "dist/${WHEEL_NAME}" --repo "${GITHUB_REPOSITORY}" --clobber
+
+          echo "${NOTES}" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload wheel artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: tpu-sync-torch-wheel-${{ steps.stamp.outputs.version }}
+          path: |
+            tpu-sync/dist/tpu_sync_torch-*${{ steps.stamp.outputs.wheel_version_extras }}-*.whl
+            tpu-sync/dist/torch_tpu_version.txt
+          if-no-files-found: error
